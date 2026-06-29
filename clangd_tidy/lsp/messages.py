@@ -25,6 +25,7 @@ class NotificationMethod(Enum):
     DID_OPEN = "textDocument/didOpen"
     DID_CLOSE = "textDocument/didClose"
     PUBLISH_DIAGNOSTICS = "textDocument/publishDiagnostics"
+    FILE_STATUS = "textDocument/clangd.fileStatus"
 
 
 @unique
@@ -152,6 +153,12 @@ class PublishDiagnosticsParams(Params):
     uri: str
     diagnostics: List[Diagnostic]
     version: Optional[int] = None
+
+
+@define
+class FileStatusParams(Params):
+    uri: str
+    state: str
 
 
 @define

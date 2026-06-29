@@ -3,7 +3,7 @@
 import asyncio
 import pathlib
 import sys
-from typing import Collection, List, Optional, TextIO
+from typing import Collection, List, Optional, Set, TextIO
 from unittest.mock import MagicMock
 from urllib.parse import unquote, urlparse
 
@@ -21,6 +21,7 @@ from .lsp import ClangdAsync, RequestResponsePair
 from .lsp.messages import (
     Diagnostic,
     DocumentFormattingParams,
+    FileStatusParams,
     LspNotificationMessage,
     NotificationMethod,
     Position,
@@ -91,25 +92,36 @@ class ClangdRunner:
         formatting_diagnostics: DiagnosticCollection = (
             {} if self._run_format else {file: [] for file in self._files}
         )
+
+        # clangd may publish diagnostics multiple times per file (e.g. an early
+        # diagnostics before the codebase is processed, followed by corrected
+        # diagnostics). We wait until textDocument/changd.fileStatus state="idle"
+        # to signal that it's fully done
+        diagnostics_done: Set[pathlib.Path] = set()
         nfiles = len(self._files)
         tqdm = _try_import_tqdm(self._tqdm)
         with tqdm(
             total=nfiles,
             desc="Collecting diagnostics",
         ) as pbar:
-            while len(diagnostics) < nfiles or len(formatting_diagnostics) < nfiles:
+            while len(diagnostics_done) < nfiles or len(formatting_diagnostics) < nfiles:
                 resp = await self._clangd.recv_response_or_notification()
                 if isinstance(resp, LspNotificationMessage):
                     if resp.method == NotificationMethod.PUBLISH_DIAGNOSTICS:
                         params = cattrs.structure(resp.params, PublishDiagnosticsParams)
                         file = _uri_to_path(params.uri)
-                        # Note: didClose triggers a new, empty publishDiagnostics
-                        # "file not in diagnostics" required to persist the first diagnostic, from the open file
-                        if file in self._files and file not in diagnostics:
-                            if file in formatting_diagnostics:
-                                # All diagnostics received
-                                await self._clangd.did_close(file)
+                        # On didClose, LSP servers send empty diagnostics to erase them.
+                        # Without "file not in diagnostics_done", we'd lose the correct diagnostics
+                        if file in self._files and file not in diagnostics_done:
                             diagnostics[file] = params.diagnostics
+                    elif resp.method == NotificationMethod.FILE_STATUS:
+                        params = cattrs.structure(resp.params, FileStatusPArams)
+                        file = _uri_to_path(params.uri)
+                        # "file not in diagnostics_done" might be not needed, but let's protect against
+                        # an idle file becoming active again - e.g. if the user modifies it concurrently
+                        if params.state == "idle" and file not in diagnostics_done:
+                            diagnostics_done.add(file)
+                            await self._clangd.did_close(file)
                             tqdm.update(pbar)  # type: ignore
                             self._sem.release()
                 else:
@@ -119,24 +131,20 @@ class ClangdRunner:
                         resp.request.params, DocumentFormattingParams
                     )
                     file = _uri_to_path(params.textDocument.uri)
-                    if file not in formatting_diagnostics:
-                        if file in diagnostics:
-                            # All diagnostics received
-                            await self._clangd.did_close(file)
-                        formatting_diagnostics[file] = (
-                            [
-                                Diagnostic(
-                                    range=Range(
-                                        start=Position(0, 0), end=Position(0, 0)
-                                    ),
-                                    message="File does not conform to the formatting rules (run `clang-format` to fix)",
-                                    source="clang-format",
-                                )
-                            ]
-                            if resp.response.result
-                            else []
-                        )
-                        self._sem.release()
+                    formatting_diagnostics[file] = (
+                        [
+                            Diagnostic(
+                                range=Range(
+                                    start=Position(0, 0), end=Position(0, 0)
+                                ),
+                                message="File does not conform to the formatting rules (run `clang-format` to fix)",
+                                source="clang-format",
+                            )
+                        ]
+                        if resp.response.result
+                        else []
+                    )
+                    self._sem.release()
         return {
             file: formatting_diagnostics[file] + diagnostics[file]
             for file in self._files

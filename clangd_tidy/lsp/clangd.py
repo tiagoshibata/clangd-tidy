@@ -70,6 +70,7 @@ class ClangdAsync:
                 workspaceFolders=[
                     WorkspaceFolder(name="foo", uri=root.as_uri()),
                 ],
+                initializationOptions={"clangdFileStatus": True},
             ),
         )
 
